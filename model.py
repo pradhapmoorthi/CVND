@@ -21,7 +21,7 @@ class EncoderCNN(nn.Module):
         m = torchvision.models.resnet50(
             weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
         )
-        self.cnn = nn.Sequential(*list(m.children())[:-2])  # -> (B, 2048, Hf, Wf)
+        self.cnn = nn.Sequential(*list(m.children())[:-1])  # -> (B, 2048, Hf, Wf)
         self.adapt = nn.Conv2d(2048, embed_size, kernel_size=1)
 
         for p in self.cnn.parameters():
