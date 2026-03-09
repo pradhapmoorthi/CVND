@@ -65,14 +65,18 @@ class SpatialAttention(nn.Module):
 # ==============  Decoder: Spatial-only LSTM  =============
 class DecoderRNN(nn.Module):
     """
-    Call as: decoder = DecoderRNN(embed_size, hidden_size, vocab_size)
+    Spatial-attention LSTM caption decoder (separate from the encoder).
+    Call as: DecoderRNN(embed_size, hidden_size, vocab_size)
+    Returns L logits to match captions.shape[1].
     """
-    def __init__(self,
-                 embed_size: int,
-                 hidden_size: int,
-                 vocab_size: int,
-                 dropout: float = 0.3,
-                 teacher_forcing_ratio: float = 1.0):
+    def __init__(
+        self,
+        embed_size: int,
+        hidden_size: int,
+        vocab_size: int,
+        dropout: float = 0.3,
+        teacher_forcing_ratio: float = 1.0
+    ):
         super().__init__()
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
@@ -80,6 +84,7 @@ class DecoderRNN(nn.Module):
 
         self.embed = nn.Embedding(vocab_size, embed_size, padding_idx=0)
         self.attn  = SpatialAttention(feat_dim=embed_size, hidden_dim=hidden_size)
+        # input = word emb (embed_size) + context (embed_size)
         self.lstm  = nn.LSTMCell(embed_size + embed_size, hidden_size)
         self.drop  = nn.Dropout(dropout)
         self.fc    = nn.Linear(hidden_size, vocab_size)
@@ -89,39 +94,48 @@ class DecoderRNN(nn.Module):
 
     def forward(self, feats: torch.Tensor, captions: torch.Tensor) -> torch.Tensor:
         """
-        feats: (B, T, embed_size) from EncoderCNN
-        captions: (B, L), with BOS at position 0
-        returns logits: (B, L-1, vocab_size)
+        feats    : (B, T, embed_size) from EncoderCNN (B1)
+        captions : (B, L) with BOS at index 0
+        returns  : (B, L, vocab_size)  <-- matches your assert
         """
         B, L = captions.size()
         device = captions.device
+
         h = torch.zeros(B, self.hidden_size, device=device)
         c = torch.zeros(B, self.hidden_size, device=device)
 
         outputs = []
-        inp = self.embed(captions[:, 0])  # BOS
 
-        for t in range(1, L):
-            ctx, _ = self.attn(feats, h)                         # (B, embed)
-            h, c = self.lstm(torch.cat([inp, ctx], dim=1), (h, c))
+        # Step 0 input is BOS
+        inp = self.embed(captions[:, 0])  # (B, embed_size)
+
+        for t in range(L):  # produce L logits
+            # Attend + step
+            ctx, _ = self.attn(feats, h)                         # (B, embed_size)
+            h, c  = self.lstm(torch.cat([inp, ctx], dim=1), (h, c))
             logits = self.fc(self.drop(h))                        # (B, vocab)
             outputs.append(logits.unsqueeze(1))                   # (B, 1, vocab)
 
-            if random.random() < self.teacher_forcing_ratio:
-                inp = self.embed(captions[:, t])
-            else:
-                inp = self.embed(logits.argmax(dim=-1))
+            # Prepare input for next time step
+            if t + 1 < L:  # only fetch next GT token if it exists
+                if random.random() < self.teacher_forcing_ratio:
+                    inp = self.embed(captions[:, t + 1])          # ground truth next token
+                else:
+                    inp = self.embed(logits.argmax(dim=-1))       # model's prediction
 
-        return torch.cat(outputs, dim=1)
+        return torch.cat(outputs, dim=1)  # (B, L, vocab_size)
 
     @torch.no_grad()
-    def greedy_decode(self, feats, bos_id, eos_id, max_len=20):
+    def greedy_decode(self, feats: torch.Tensor, bos_id: int, eos_id: int, max_len: int = 20):
         B = feats.size(0)
         device = feats.device
+
         h = torch.zeros(B, self.hidden_size, device=device)
         c = torch.zeros(B, self.hidden_size, device=device)
+
         x = torch.full((B,), bos_id, dtype=torch.long, device=device)
         emb = self.embed(x)
+
         seqs, alphas = [], []
         for _ in range(max_len):
             ctx, alpha = self.attn(feats, h)
@@ -131,6 +145,7 @@ class DecoderRNN(nn.Module):
             seqs.append(x)
             alphas.append(alpha.squeeze(-1))  # (B, T)
             emb = self.embed(x)
+
         out = []
         for b in range(B):
             toks = []
@@ -142,11 +157,13 @@ class DecoderRNN(nn.Module):
         return out, alphas
 
     @torch.no_grad()
-    def beam_search(self, feats, bos_id, eos_id, beam=3, max_len=20):
-        assert feats.size(0) == 1, "Beam search supports B=1 only."
+    def beam_search(self, feats: torch.Tensor, bos_id: int, eos_id: int, beam: int = 3, max_len: int = 20):
+        assert feats.size(0) == 1, "Beam search supports batch size 1 only."
         device = feats.device
+
         h = torch.zeros(1, self.hidden_size, device=device)
         c = torch.zeros(1, self.hidden_size, device=device)
+
         beams = [([bos_id], 0.0, h, c)]
         for _ in range(max_len):
             new_beams = []
@@ -154,10 +171,13 @@ class DecoderRNN(nn.Module):
                 if toks[-1] == eos_id:
                     new_beams.append((toks, score, h_prev, c_prev))
                     continue
+
                 x = torch.tensor([toks[-1]], device=device)
                 emb = self.embed(x)
+
                 ctx, _ = self.attn(feats, h_prev)
                 h_new, c_new = self.lstm(torch.cat([emb, ctx], dim=1), (h_prev, c_prev))
+
                 logits = self.fc(h_new)
                 logprobs = F.log_softmax(logits, dim=-1)
                 topk = torch.topk(logprobs, k=beam, dim=-1)
@@ -167,6 +187,7 @@ class DecoderRNN(nn.Module):
                     new_beams.append((toks + [tok], sc, h_new.clone(), c_new.clone()))
             new_beams.sort(key=lambda x: x[1], reverse=True)
             beams = new_beams[:beam]
+
         best = beams[0][0]
         out = []
         for t in best[1:]:
