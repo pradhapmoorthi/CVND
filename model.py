@@ -18,6 +18,7 @@ try:
 except Exception:
     nltk_ok = False
 
+# -------------------- Repro & Device --------------------
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
@@ -29,355 +30,254 @@ print('Device:', device)
 
 SPECIAL_TOKENS = {'pad':'<pad>', 'bos':'<bos>', 'eos':'<eos>', 'unk':'<unk>'}
 
-# -------- Global feature encoder & attention --------
-class EncoderCNN_Global(nn.Module):
+# ========================================================
+# ================== Encoder: Spatial CNN =================
+# ========================================================
+class EncoderCNN(nn.Module):
     """
-    CNN-based encoder that extracts global features from images using a pre-trained ResNet-50.
+    Spatial feature encoder using ResNet-50.
+    - Outputs spatial sequence of features (B, Hf*Wf, embed_size).
+    - Call as: EncoderCNN(embed_size)
     """
-    def __init__(self, cnn_name='resnet50', embed_dim=256, train_backbone=False):
-        """
-        Initializes the EncoderCNN_Global.
-        Args:
-            cnn_name (str): The name of the CNN backbone to use (currently only 'resnet50').
-            embed_dim (int): The dimension to which the extracted image features will be projected.
-            train_backbone (bool): If True, the CNN backbone parameters will be fine-tuned.
-        """
+    def __init__(self, embed_size: int):
         super().__init__()
-        if cnn_name == 'resnet50':
-            # Load a pre-trained ResNet-50 model
-            backbone = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
-            # Remove the last fully connected layer to get feature maps
-            modules = list(backbone.children())[:-1]
-            self.cnn = nn.Sequential(*modules)
-            feat_dim = backbone.fc.in_features # Get the dimension of features from the backbone
-        else:
-            raise ValueError('Unsupported CNN: ' + cnn_name)
-        # Freeze backbone parameters if train_backbone is False
+        self.embed_size = embed_size
+
+        # Backbone
+        m = torchvision.models.resnet50(
+            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
+        )
+        self.cnn = nn.Sequential(*list(m.children())[:-2])  # B,2048,Hf,Wf
+        self.adapt = nn.Conv2d(2048, embed_size, kernel_size=1)
+
+        # By default, keep backbone frozen. Flip requires_grad to fine-tune if desired.
         for p in self.cnn.parameters():
-            p.requires_grad = train_backbone
-        self.fc = nn.Linear(feat_dim, embed_dim) # Fully connected layer to project features to embed_dim
-        self.bn = nn.BatchNorm1d(embed_dim) # Batch normalization layer
+            p.requires_grad = False
 
-    def forward(self, images):
+    def forward(self, images: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
-        Processes input images through the global CNN encoder.
         Args:
-            images (torch.Tensor): A batch of input images.
+            images: (B, 3, H, W)
         Returns:
-            torch.Tensor: A tensor of extracted global image features of shape (batch_size, embed_dim).
+            seq : (B, Hf*Wf, embed_size)
+            (Hf, Wf): spatial dims of the feature map
         """
-        feats = self.cnn(images).flatten(1) # Pass images through CNN and flatten features
-        feats = F.relu(self.bn(self.fc(feats)))  # (B,E) # Apply FC, BN, and ReLU activation
-        return feats
+        fmap = self.cnn(images)          # (B, 2048, Hf, Wf) ~ (7,7) for 224x224
+        fmap = self.adapt(fmap)          # (B, embed_size, Hf, Wf)
+        B, C, Hf, Wf = fmap.shape
+        seq = fmap.permute(0, 2, 3, 1).contiguous().view(B, Hf * Wf, C)  # (B, T, C)
+        return seq, (Hf, Wf)
 
-class BahdanauAttention_Global(nn.Module):
-    """
-    Bahdanau-style attention mechanism for global features.
-    """
-    def __init__(self, enc_dim, dec_hidden, attn_dim):
-        """
-        Initializes the BahdanauAttention_Global.
-        Args:
-            enc_dim (int): The dimension of the encoder output features.
-            dec_hidden (int): The dimension of the decoder's hidden state.
-            attn_dim (int): The dimension of the attention intermediate layer.
-        """
-        super().__init__()
-        self.W = nn.Linear(enc_dim, attn_dim) # Linear layer for encoder output
-        self.U = nn.Linear(dec_hidden, attn_dim) # Linear layer for decoder hidden state
-        self.v = nn.Linear(attn_dim, 1) # Linear layer to compute attention scores
-
-    def forward(self, enc_out, hidden):
-        """
-        Computes attention weights and a context vector.
-        Args:
-            enc_out (torch.Tensor): The encoder's output feature vector (batch_size, enc_dim).
-            hidden (torch.Tensor): The decoder's current hidden state (batch_size, dec_hidden).
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                context (torch.Tensor): The context vector (batch_size, enc_dim).
-                alpha (torch.Tensor): The attention weights (batch_size, 1).
-        """
-        # Compute attention scores
-        score = self.v(torch.tanh(self.W(enc_out) + self.U(hidden)))  # (B,1)
-        alpha = torch.softmax(score, dim=1)                            # (B,1) # Apply softmax to get attention weights
-        context = alpha * enc_out                                      # (B,E) # Compute context vector as weighted sum of encoder output
-        return context, alpha
-
-class Decoder_Global(nn.Module):
-    """
-    Decoder for global attention, generating captions word by word.
-    """
-    def __init__(self, vocab_size, embed_dim, hidden_dim, attn_dim, dropout=0.3):
-        """
-        Initializes the Decoder_Global.
-        Args:
-            vocab_size (int): The size of the vocabulary.
-            embed_dim (int): The dimension of word embeddings.
-            hidden_dim (int): The dimension of the LSTM hidden state.
-            attn_dim (int): The dimension of the attention intermediate layer.
-            dropout (float): Dropout probability for regularization.
-        """
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0) # Embedding layer for tokens
-        self.attn  = BahdanauAttention_Global(embed_dim, hidden_dim, attn_dim) # Bahdanau attention mechanism
-        self.lstm  = nn.LSTMCell(embed_dim + embed_dim, hidden_dim) # LSTM cell for sequential processing
-        self.fc    = nn.Linear(hidden_dim, vocab_size) # Fully connected layer to predict next token
-        self.drop  = nn.Dropout(dropout) # Dropout layer for regularization
-
-    def forward(self, enc_feat, captions):
-        """
-        Performs a forward pass during training, decoding a sequence of captions.
-        Args:
-            enc_feat (torch.Tensor): Global features from the encoder (B, E).
-            captions (torch.Tensor): Ground truth captions (B, T).
-        Returns:
-            torch.Tensor: Logits for each token prediction at each time step (B, T-1, vocab_size).
-        """
-        B,T = captions.size() # Batch size and sequence length
-        # Initialize hidden and cell states of LSTM
-        h = captions.new_zeros((B, self.lstm.hidden_size), dtype=torch.float).to(captions.device)
-        c = captions.new_zeros((B, self.lstm.hidden_size), dtype=torch.float).to(captions.device)
-        inp = self.embed(captions[:,0]) # Get embedding for the first token (BOS)
-        outs=[] # List to store decoder outputs
-        for t in range(1,T):
-            ctx,_ = self.attn(enc_feat, h) # Compute context vector using attention
-            h,c = self.lstm(torch.cat([inp, ctx], dim=1), (h,c)) # Pass concatenated input and context to LSTM
-            logits = self.fc(self.drop(h)) # Predict logits for the next token
-            outs.append(logits.unsqueeze(1)) # Store logits
-            inp = self.embed(captions[:,t]) # Get embedding for the next token from input captions
-        return torch.cat(outs, dim=1) # Concatenate all outputs
-
-    def greedy_decode(self, enc_feat, bos_id, eos_id, max_len=20):
-        """
-        Generates captions using a greedy search strategy.
-        Args:
-            enc_feat (torch.Tensor): Global features from the encoder (B, E).
-            bos_id (int): ID of the Begin-Of-Sentence token.
-            eos_id (int): ID of the End-Of-Sentence token.
-            max_len (int): Maximum length of the generated caption.
-        Returns:
-            List[List[int]]: A list of decoded token ID sequences, one for each image in the batch.
-        """
-        B = enc_feat.size(0) # Batch size
-        # Initialize hidden and cell states
-        h = enc_feat.new_zeros((B, self.lstm.hidden_size))
-        c = enc_feat.new_zeros((B, self.lstm.hidden_size))
-        # Start with BOS token
-        x = torch.full((B,), bos_id, dtype=torch.long, device=enc_feat.device)
-        emb = self.embed(x) # Get embedding for current token
-        seqs=[] # List to store decoded token IDs
-        for _ in range(max_len):
-            ctx,_ = self.attn(enc_feat, h) # Compute context vector
-            h,c = self.lstm(torch.cat([emb, ctx], dim=1), (h,c)) # Update LSTM states
-            logit = self.fc(h) # Predict logits
-            x = logit.argmax(-1) # Get token with highest probability (greedy choice)
-            seqs.append(x) # Store predicted token
-            emb = self.embed(x) # Get embedding for the next predicted token
-        out=[] # List to store decoded captions (list of tokens)
-        # Process each sample in the batch
-        for b in range(B):
-            toks=[]
-            for t in seqs:
-                tok = t[b].item()
-                if tok==eos_id: break # Stop if EOS token is encountered
-                toks.append(tok) # Add token to caption
-            out.append(toks)
-        return out
-
-# -------- Spatial feature encoder & attention --------
-class EncoderCNN_Spatial(nn.Module):
-    """
-    CNN-based encoder that extracts spatial feature maps from images for spatial attention.
-    """
-    def __init__(self):
-        """
-        Initializes the EncoderCNN_Spatial.
-        """
-        super().__init__()
-        m = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2) # Load pre-trained ResNet-50
-        self.cnn = nn.Sequential(*list(m.children())[:-2])  # Bx2048x7x7 # Remove last two layers to get convolutional feature maps
-        self.adapt = nn.Conv2d(2048, 512, kernel_size=1) # 1x1 convolution to reduce feature map depth
-
-    def forward(self, images):
-        """
-        Processes input images through the spatial CNN encoder to extract spatial feature maps.
-        Args:
-            images (torch.Tensor): A batch of input images.
-        Returns:
-            Tuple[torch.Tensor, Tuple[int, int]]:
-                seq (torch.Tensor): A sequence of spatial features, reshaped to (batch_size, H*W, channels).
-                (H,W) (Tuple[int, int]): The height and width of the feature maps.
-        """
-        fmap = self.cnn(images)     # B,2048,7,7 # Get feature maps from CNN
-        fmap = self.adapt(fmap)     # B,512,7,7 # Apply 1x1 convolution
-        B,C,H,W = fmap.shape # Get batch size, channels, height, width
-        seq = fmap.permute(0,2,3,1).contiguous().view(B, H*W, C)  # B,T(=49),512 # Reshape feature map for attention (B, H*W, C)
-        return seq, (H,W) # Return sequence of features and original H,W dimensions
-
+# ========================================================
+# ===============  Spatial Attention Module  ==============
+# ========================================================
 class SpatialAttention(nn.Module):
     """
-    Spatial attention mechanism that focuses on different regions of an image.
+    Additive (Bahdanau-style) spatial attention over a set of features (B, T, C)
+    conditioned on decoder hidden state h_t (B, H).
     """
-    def __init__(self, feat_dim, hidden_dim):
-        """
-        Initializes the SpatialAttention.
-        Args:
-            feat_dim (int): The dimension of the spatial feature vectors.
-            hidden_dim (int): The dimension of the decoder's hidden state.
-        """
+    def __init__(self, feat_dim: int, hidden_dim: int):
         super().__init__()
-        self.W = nn.Linear(feat_dim, hidden_dim) # Linear layer for input features
-        self.U = nn.Linear(hidden_dim, hidden_dim) # Linear layer for hidden state
-        self.v = nn.Linear(hidden_dim, 1) # Linear layer to compute attention scores
+        self.W = nn.Linear(feat_dim, hidden_dim, bias=True)
+        self.U = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, 1, bias=False)
 
-    def forward(self, feats, hidden):
+    def forward(self, feats: torch.Tensor, hidden: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes spatial attention weights and a context vector from spatial features and decoder hidden state.
         Args:
-            feats (torch.Tensor): Spatial features (B, T, C).
-            hidden (torch.Tensor): The decoder's current hidden state (B, H).
+            feats : (B, T, C)
+            hidden: (B, H)
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                ctx (torch.Tensor): The context vector (B, C).
-                alpha (torch.Tensor): The attention weights (B, T, 1).
+            ctx   : (B, C)   context vector
+            alpha : (B, T, 1) attention weights
         """
-        # feats: B,T,C; hidden: B,H
-        # Compute attention scores
-        score = self.v(torch.tanh(self.W(feats) + self.U(hidden).unsqueeze(1)))  # B,T,1
-        alpha = torch.softmax(score, dim=1)                                       # B,T,1 # Apply softmax for attention weights
-        ctx = (alpha * feats).sum(1)                                              # B,C # Compute context vector
+        score = self.v(torch.tanh(self.W(feats) + self.U(hidden).unsqueeze(1)))  # (B, T, 1)
+        alpha = torch.softmax(score, dim=1)                                      # (B, T, 1)
+        ctx = (alpha * feats).sum(dim=1)                                         # (B, C)
         return ctx, alpha
 
-class Decoder_Spatial(nn.Module):
+# ========================================================
+# ==============  Decoder: Spatial-only LSTM  =============
+# ========================================================
+class DecoderRNN(nn.Module):
     """
-    Decoder for spatial attention, generating captions word by word.
+    Spatial-attention LSTM caption decoder (separate from the encoder).
+    - Uses ONLY spatial attention
+    - Supports teacher forcing ratio during training
+    - Greedy decoding (returns attention maps)
+    - Beam search (supports B=1)
+    Call as: DecoderRNN(embed_size, hidden_size, vocab_size)
     """
-    def __init__(self, vocab_size, embed_dim=256, hidden_dim=512, feat_dim=512, dropout=0.3):
-        """
-        Initializes the Decoder_Spatial.
-        Args:
-            vocab_size (int): The size of the vocabulary.
-            embed_dim (int): The dimension of word embeddings.
-            hidden_dim (int): The dimension of the LSTM hidden state.
-            feat_dim (int): The dimension of the spatial feature vectors.
-            dropout (float): Dropout probability for regularization.
-        """
+    def __init__(
+        self,
+        embed_size: int,
+        hidden_size: int,
+        vocab_size: int,
+        dropout: float = 0.3,
+        teacher_forcing_ratio: float = 1.0
+    ):
         super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim, padding_idx=0) # Embedding layer for tokens
-        self.attn  = SpatialAttention(feat_dim, hidden_dim) # Spatial attention mechanism
-        self.lstm  = nn.LSTMCell(embed_dim + feat_dim, hidden_dim) # LSTM cell
-        self.fc    = nn.Linear(hidden_dim, vocab_size) # Fully connected layer for token prediction
-        self.drop  = nn.Dropout(dropout) # Dropout layer
-        self.hidden_dim = hidden_dim
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.teacher_forcing_ratio = teacher_forcing_ratio
 
-    def forward(self, feats, captions):
-        """
-        Performs a forward pass during training for the spatial decoder.
-        Args:
-            feats (torch.Tensor): Spatial features from the encoder (B, H*W, C).
-            captions (torch.Tensor): Ground truth captions (B, T).
-        Returns:
-            torch.Tensor: Logits for each token prediction at each time step (B, T-1, vocab_size).
-        """
-        B,T = captions.size()
-        # Initialize hidden and cell states
-        h = feats.new_zeros((B, self.hidden_dim))
-        c = feats.new_zeros((B, self.hidden_dim))
-        inp = self.embed(captions[:,0]) # Embedding for the first token
-        outs=[]
-        for t in range(1,T):
-            ctx,_ = self.attn(feats, h) # Compute context vector with spatial attention
-            h,c = self.lstm(torch.cat([inp, ctx], dim=1), (h,c)) # Update LSTM states
-            logits = self.fc(self.drop(h)) # Predict logits
-            outs.append(logits.unsqueeze(1))
-            inp = self.embed(captions[:,t]) # Embedding for the next token
-        return torch.cat(outs, dim=1)
+        self.embed = nn.Embedding(vocab_size, embed_size, padding_idx=0)
+        self.attn  = SpatialAttention(feat_dim=embed_size, hidden_dim=hidden_size)
+        self.lstm  = nn.LSTMCell(embed_size + embed_size, hidden_size)  # emb + ctx
+        self.drop  = nn.Dropout(dropout)
+        self.fc    = nn.Linear(hidden_size, vocab_size)
 
-    def greedy_decode(self, feats, bos_id, eos_id, max_len=20):
+    def set_teacher_forcing_ratio(self, tfr: float):
+        """Update teacher forcing ratio on the fly."""
+        self.teacher_forcing_ratio = float(tfr)
+
+    def forward(self, feats: torch.Tensor, captions: torch.Tensor) -> torch.Tensor:
         """
-        Generates captions using a greedy search strategy with spatial attention.
+        Training forward pass with optional teacher forcing.
         Args:
-            feats (torch.Tensor): Spatial features from the encoder (B, H*W, C).
-            bos_id (int): ID of the Begin-Of-Sentence token.
-            eos_id (int): ID of the End-Of-Sentence token.
-            max_len (int): Maximum length of the generated caption.
+            feats    : (B, T, embed_size) from EncoderCNN
+            captions : (B, L) token ids; first token expected to be BOS
         Returns:
-            Tuple[List[List[int]], List[torch.Tensor]]:
-                List[List[int]]: A list of decoded token ID sequences.
-                List[torch.Tensor]: A list of attention weights (B, H*W) for each generated token.
+            logits   : (B, L-1, vocab_size) predictions for tokens 1..L-1
+        """
+        B, L = captions.size()
+        device = captions.device
+
+        h = torch.zeros(B, self.hidden_size, device=device)
+        c = torch.zeros(B, self.hidden_size, device=device)
+
+        outputs = []
+
+        # First input is BOS
+        inp = self.embed(captions[:, 0])  # (B, emb)
+
+        for t in range(1, L):
+            # Attention & LSTM step
+            ctx, _ = self.attn(feats, h)                         # (B, emb)
+            h, c = self.lstm(torch.cat([inp, ctx], dim=1), (h, c))
+            logits = self.fc(self.drop(h))                        # (B, vocab)
+            outputs.append(logits.unsqueeze(1))                   # (B, 1, vocab)
+
+            # Teacher forcing / scheduled sampling
+            use_tf = (random.random() < self.teacher_forcing_ratio)
+            if use_tf:
+                inp = self.embed(captions[:, t])                  # use ground-truth next token
+            else:
+                next_ids = logits.argmax(dim=-1)                  # use model prediction
+                inp = self.embed(next_ids)
+
+        return torch.cat(outputs, dim=1)  # (B, L-1, vocab_size)
+
+    @torch.no_grad()
+    def greedy_decode(
+        self, feats: torch.Tensor, bos_id: int, eos_id: int, max_len: int = 20
+    ) -> Tuple[List[List[int]], List[torch.Tensor]]:
+        """
+        Greedy decoding for a batch.
+        Args:
+            feats  : (B, T, embed_size)
+            bos_id : int
+            eos_id : int
+            max_len: maximum generated length (excluding BOS)
+        Returns:
+            seqs   : List[List[int]] token ids per sample (without BOS/EOS)
+            alphas : List[Tensor] list of attention weights (B, T) per step
         """
         B = feats.size(0)
-        # Initialize hidden and cell states
-        h = feats.new_zeros((B, self.hidden_dim))
-        c = feats.new_zeros((B, self.hidden_dim))
-        # Start with BOS token
-        x = torch.full((B,), bos_id, dtype=torch.long, device=feats.device)
+        device = feats.device
+
+        h = torch.zeros(B, self.hidden_size, device=device)
+        c = torch.zeros(B, self.hidden_size, device=device)
+
+        x = torch.full((B,), bos_id, dtype=torch.long, device=device)
         emb = self.embed(x)
-        seqs=[]; alphas=[] # Lists to store sequences and attention weights
+
+        seqs = []
+        alphas = []
+
         for _ in range(max_len):
-            ctx,alpha = self.attn(feats, h) # Compute context vector and attention weights
-            h,c = self.lstm(torch.cat([emb, ctx], dim=1), (h,c)) # Update LSTM states
-            logit = self.fc(h)
-            x = logit.argmax(-1) # Greedy token prediction
-            seqs.append(x)
-            alphas.append(alpha.squeeze(-1))  # B,T # Store attention weights
+            ctx, alpha = self.attn(feats, h)               # alpha: (B, T, 1)
+            h, c = self.lstm(torch.cat([emb, ctx], dim=1), (h, c))
+            logits = self.fc(h)                             # (B, vocab)
+            x = logits.argmax(dim=-1)                      # (B,)
+
+            seqs.append(x)                                  # store step-wise predictions
+            alphas.append(alpha.squeeze(-1))               # (B, T)
+
             emb = self.embed(x)
-        # stop at eos per sample
-        out=[]
+
+        # Stop at EOS per sample
+        out = []
         for b in range(B):
-            toks=[]
+            toks = []
             for t in seqs:
-                tok=t[b].item()
-                if tok==eos_id: break
+                tok = int(t[b].item())
+                if tok == eos_id:
+                    break
                 toks.append(tok)
             out.append(toks)
-        return out, alphas  # list of tokens per sample, and list of alpha tensors per step
 
-    def beam_search(self, feats, bos_id, eos_id, beam=3, max_len=20):
+        return out, alphas
+
+    @torch.no_grad()
+    def beam_search(
+        self, feats: torch.Tensor, bos_id: int, eos_id: int,
+        beam: int = 3, max_len: int = 20
+    ) -> List[int]:
         """
-        Generates a single caption using beam search, which explores multiple high-probability sequences.
+        Beam search decoding (supports batch size = 1).
         Args:
-            feats (torch.Tensor): Spatial features from the encoder (batch_size=1, H*W, C).
-            bos_id (int): ID of the Begin-Of-Sentence token.
-            eos_id (int): ID of the End-Of-Sentence token.
-            beam (int): The beam width (number of sequences to keep at each step).
-            max_len (int): Maximum length of the generated caption.
+            feats  : (1, T, embed_size)
+            bos_id : int
+            eos_id : int
+            beam   : beam width
+            max_len: maximum generated length
         Returns:
-            List[int]: The best decoded token ID sequence.
-        Note: This implementation currently supports a batch size of 1.
+            best sequence of token ids (without BOS/EOS)
         """
-        # NOTE: supports B==1 for simplicity
-        assert feats.size(0) == 1, 'Beam search currently supports batch size 1.'
-        # Initialize hidden and cell states
-        h = feats.new_zeros((1, self.hidden_dim))
-        c = feats.new_zeros((1, self.hidden_dim))
-        # Initialize sequences for beam search: (tokens, logprob, h, c)
-        sequences = [([bos_id], 0.0, h, c)]
+        assert feats.size(0) == 1, "Beam search supports batch size 1 only."
+        device = feats.device
+
+        h = torch.zeros(1, self.hidden_size, device=device)
+        c = torch.zeros(1, self.hidden_size, device=device)
+
+        # beams: list of tuples (tokens, logprob, h, c)
+        beams = [([bos_id], 0.0, h, c)]
+
         for _ in range(max_len):
-            new_list = []
-            for toks,score,hx,cx in sequences:
+            new_beams = []
+            for toks, score, h_prev, c_prev in beams:
                 if toks[-1] == eos_id:
-                    new_list.append((toks, score, hx, cx))
+                    # Already ended; keep as is
+                    new_beams.append((toks, score, h_prev, c_prev))
                     continue
-                x = torch.tensor([toks[-1]], device=feats.device) # Current token
-                emb = self.embed(x) # Embedding for the current token
-                ctx,_ = self.attn(feats, hx) # Compute context vector
-                hx, cx = self.lstm(torch.cat([emb, ctx], dim=1), (hx, cx)) # Update LSTM states
-                logits = self.fc(hx) # Predict logits
-                logprobs = F.log_softmax(logits, dim=-1) # Convert logits to log probabilities
-                topk = torch.topk(logprobs, beam) # Get top 'beam' probable next tokens
+
+                x = torch.tensor([toks[-1]], device=device)
+                emb = self.embed(x)
+
+                ctx, _ = self.attn(feats, h_prev)
+                h_new, c_new = self.lstm(torch.cat([emb, ctx], dim=1), (h_prev, c_prev))
+
+                logits = self.fc(h_new)                    # (1, vocab)
+                logprobs = F.log_softmax(logits, dim=-1)   # (1, vocab)
+                topk = torch.topk(logprobs, k=beam, dim=-1)
+
                 for i in range(beam):
-                    tok = int(topk.indices[0, i].item())
-                    sc  = float(score + topk.values[0, i].item())
-                    new_list.append((toks + [tok], sc, hx.clone(), cx.clone())) # Add new sequences to the list
-            # Prune sequences to keep only the top 'beam' sequences based on log probability
-            new_list.sort(key=lambda x: x[1], reverse=True)
-            sequences = new_list[:beam]
-        best = sequences[0][0] # Get the best sequence from beam search
-        # strip BOS and cut at EOS
-        out=[]
-        for t in best[1:]:
-            if t==eos_id: break # Stop at EOS token
+                    tok = int(topk.indices[0, i])
+                    sc  = score + float(topk.values[0, i])
+                    new_beams.append((toks + [tok], sc, h_new.clone(), c_new.clone()))
+
+            # Keep top-K beams
+            new_beams.sort(key=lambda x: x[1], reverse=True)
+            beams = new_beams[:beam]
+
+        # Best sequence (highest logprob)
+        best_tokens = beams[0][0]
+
+        # Strip BOS and cut at EOS
+        out = []
+        for t in best_tokens[1:]:
+            if t == eos_id:
+                break
             out.append(t)
         return out
