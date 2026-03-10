@@ -4,47 +4,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from typing import Tuple, List
+import torchvision.models as models
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ================== Encoder: Spatial CNN =================
 class EncoderCNN(nn.Module):
-    """
-    Spatial feature encoder using ResNet-50.
-    - Call as: encoder = EncoderCNN(embed_size)
-    - forward(images) -> Tensor of shape (B, T=Hf*Wf, embed_size)
-    """
-    def __init__(self, embed_size: int, train_backbone: bool = False):
-        super().__init__()
-        self.embed_size = embed_size
+    def __init__(self, embed_size):
+        super(EncoderCNN, self).__init__()
+        resnet = models.resnet50(pretrained=True)
+        for param in resnet.parameters():
+            param.requires_grad_(False)
 
-        m = torchvision.models.resnet50(
-            weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2
-        )
-        self.cnn = nn.Sequential(*list(m.children())[:-1])  # -> (B, 2048, Hf, Wf)
-        self.adapt = nn.Conv2d(2048, embed_size, kernel_size=1)
+        modules = list(resnet.children())[:-1] # remove the last FC layer
+        self.resnet = nn.Sequential(*modules)
+        self.embed = nn.Linear(resnet.fc.in_features, embed_size)
 
-        for p in self.cnn.parameters():
-            p.requires_grad = train_backbone
-
-        self._last_hw: Tuple[int, int] = (0, 0)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        Returns:
-            seq : Tensor of shape (B, T=Hf*Wf, embed_size)
-        """
-        fmap = self.cnn(images)         # (B, 2048, Hf, Wf)
-        fmap = self.adapt(fmap)         # (B, embed_size, Hf, Wf)
-        B, C, Hf, Wf = fmap.shape
-        self._last_hw = (Hf, Wf)
-        seq = fmap.permute(0, 2, 3, 1).contiguous().view(B, Hf * Wf, C)  # (B, T, C)
-        return seq
-
-    def last_hw(self) -> Tuple[int, int]:
-        """Return the last (Hf, Wf) seen in forward (useful for attention heatmaps)."""
-        return self._last_hw
-
+    def forward(self, images):
+        features = self.resnet(images) # Output might be [batch_size, 2048, 1, 1]
+        features = features.view(features.size(0), -1) # Flatten the output to [batch_size, 2048]
+        features = self.embed(features)
+        return features
 
 # ===============  Spatial Attention Module  ==============
 class SpatialAttention(nn.Module):
