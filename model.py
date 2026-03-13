@@ -115,14 +115,13 @@ class DecoderRNN(nn.Module):
         x = torch.full((B,), bos_id, dtype=torch.long, device=device)
         emb = self.embed(x)
 
-        seqs = [] # alphas are not used in greedy_decode output, so they can be discarded
+        seqs = []
         for _ in range(max_len):
             ctx, alpha = self.attn(feats, h)
             h, c = self.lstm(torch.cat([emb, ctx], dim=1), (h, c))
             logits = self.fc(h)
             x = logits.argmax(dim=-1)
             seqs.append(x)
-            # alphas.append(alpha.squeeze(-1))  # (B, T) # No need to append alphas if not returned
             emb = self.embed(x)
 
         out = []
@@ -133,7 +132,9 @@ class DecoderRNN(nn.Module):
                 if tok == eos_id: break
                 toks.append(tok)
             out.append(toks)
-        return out # Changed from return out, alphas
+
+        print(f"DEBUG (greedy_decode): B={B}, len(out)={len(out)}") # ADDED DEBUG PRINT
+        return out
 
     @torch.no_grad()
     def beam_search(self, feats: torch.Tensor, bos_id: int, eos_id: int, beam: int = 3, max_len: int = 20):
