@@ -1,82 +1,94 @@
 import nltk
-from collections import Counter
+from pycocotools.coco import COCO
 import pickle
 import os
-import json # Ensure json is imported as it's used in build_vocab
+import numpy as np
+from collections import Counter
 
 class Vocabulary(object):
-    def __init__(self, vocab_threshold, annotations_file, start_word, end_word, unk_word, pad_word, annotations_file_test=None): # Added pad_word
+    """Simple vocabulary wrapper."""
+    def __init__(self, vocab_threshold, annotations_file, vocab_from_file=False,
+                 start_word="<bos>", end_word="<eos>", unk_word="<unk>", pad_word="<pad>"):
+        """Initialize the vocabulary."""
         self.vocab_threshold = vocab_threshold
+        self.annotations_file = annotations_file
+        self.vocab_from_file = vocab_from_file
         self.start_word = start_word
         self.end_word = end_word
         self.unk_word = unk_word
-        self.pad_word = pad_word # Store pad_word
-        self.annotations_file = annotations_file
-        self.annotations_file_test = annotations_file_test
+        self.pad_word = pad_word
         self.get_vocab()
 
     def get_vocab(self):
-        if os.path.exists('vocab.pkl'):
-            with open('vocab.pkl', 'rb') as f:
+        """Load the vocabulary from file or build it from captions."""
+        if os.path.exists('./vocab.pkl') and self.vocab_from_file:
+            with open('./vocab.pkl', 'rb') as f:
                 vocab = pickle.load(f)
                 self.word2idx = vocab.word2idx
                 self.idx2word = vocab.idx2word
-                # Also ensure special tokens are correctly set from loaded vocab if they were dynamic
-                self.start_word = vocab.start_word
-                self.end_word = vocab.end_word
-                self.unk_word = vocab.unk_word
-                self.pad_word = vocab.pad_word
             print('Vocabulary successfully loaded from vocab.pkl file!')
         else:
             self.build_vocab()
-            with open('vocab.pkl', 'wb') as f:
+            with open('./vocab.pkl', 'wb') as f:
                 pickle.dump(self, f)
-
+        
     def build_vocab(self):
-        self.word2idx = {}
-        self.idx2word = {}
-        # Add special tokens first to ensure consistent indices (pad=0, bos=1, eos=2, unk=3)
-        self.add_word(self.pad_word) # Index 0
-        self.add_word(self.start_word) # Index 1
-        self.add_word(self.end_word) # Index 2
-        self.add_word(self.unk_word) # Index 3
-
-        with open(self.annotations_file, 'r') as f:
-            caption_data = json.load(f)
-
+        """Populate the dictionaries for converting tokens to integers (and vice-versa)."""
+        self.init_vocab()
+        # Ensure special tokens get distinct, sequential IDs at the beginning
+        self.add_word(self.pad_word)
+        self.add_word(self.start_word)
+        self.add_word(self.end_word)
+        self.add_word(self.unk_word)
+        
+        coco = COCO(self.annotations_file)
         counter = Counter()
-        for i, annotation in enumerate(caption_data['annotations']):
-            caption = annotation['caption']
+        ids = coco.anns.keys()
+        for i, id in enumerate(ids):
+            caption = str(coco.anns[id]['caption'])
             tokens = nltk.tokenize.word_tokenize(caption.lower())
             counter.update(tokens)
 
-        words = [word for word, count in counter.items() if count >= self.vocab_threshold]
+            if i % 100000 == 0:
+                print("[%d/%d] Tokenizing captions..." % (i, len(ids)))
 
-        for word in words:
+        words = [word for word, cnt in counter.items() if cnt >= self.vocab_threshold]
+
+        for i, word in enumerate(words):
             self.add_word(word)
 
-        print(f"Total vocabulary size: {len(self.word2idx)}")
+        print('Finished building vocabulary of %d words' % len(self))
+
+    def init_vocab(self):
+        """Initialize the dictionaries for converting tokens to integers (and vice-versa)."""
+        self.word2idx = {}
+        self.idx2word = {}
+        self.idx = 0
 
     def add_word(self, word):
-        if word not in self.word2idx:
-            self.word2idx[word] = len(self.word2idx)
-            self.idx2word[len(self.idx2word)] = word
+        """Add a word to the vocabulary."""
+        if not word in self.word2idx:
+            self.word2idx[word] = self.idx
+            self.idx2word[self.idx] = word
+            self.idx += 1
+
+    def denumericalize(self, tokens):
+        """Convert a list of token IDs to a list of words."""
+        words = []
+        for token_id in tokens:
+            word = self.idx2word.get(token_id, self.unk_word)
+            # Filter out special tokens like start, end, pad from the output caption
+            if word in [self.start_word, self.end_word, self.pad_word]: 
+                continue
+            words.append(word)
+        return words
 
     def __call__(self, word):
-        if word not in self.word2idx:
+        """Return the index of a word."""
+        if not word in self.word2idx:
             return self.word2idx[self.unk_word]
         return self.word2idx[word]
 
     def __len__(self):
-        return len(self.word2idx)
-
-    # Added denumericalize method
-    def denumericalize(self, token_ids):
-        words = []
-        for token_id in token_ids:
-            word = self.idx2word.get(token_id)
-            # Only append if word exists and is not a special token other than unk (if unk is to be shown)
-            # Exclude pad_word, start_word, and end_word as they are typically stripped from references/hypotheses
-            if word and word != self.pad_word and word != self.start_word and word != self.end_word:
-                 words.append(word)
-        return words
+        """Return the size of the vocabulary."""
+        return len(self.word2idx)''')
