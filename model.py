@@ -238,3 +238,72 @@ class DecoderRNN(nn.Module):
             best_seq = seqs[scores.argmax().item()]
 
         return best_seq.tolist()
+    def sample(self, features, max_len=25):
+    """
+    Udacity-required sampler.
+    Args:
+        features: embedded image features for a single image.
+                  Common shapes:
+                    - (1, num_pixels, encoder_dim)  e.g., (1, 65536, 2048)
+                    - (1, 1, num_pixels, encoder_dim) if notebook did unsqueeze(1)
+                    - (1, 1, embed_dim) in non-attention baselines
+        max_len: maximum caption length to generate
+
+    Returns:
+        output: Python list of ints (token ids)
+    """
+
+    # --- Normalize feature shape to what beam_search expects: (B, num_pixels, encoder_dim) ---
+    encoder_out = features
+
+    # If notebook passed (1, 1, num_pixels, encoder_dim), squeeze the extra dim
+    if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
+        encoder_out = encoder_out.squeeze(1)  # -> (1, num_pixels, encoder_dim)
+
+    # If baseline passed (1, embed_dim), convert to (1, 1, embed_dim)
+    if encoder_out.dim() == 2:
+        encoder_out = encoder_out.unsqueeze(1)
+
+    # If baseline passed (1, 1, embed_dim) keep as-is; beam_search should handle num_pixels=1
+
+    # --- Determine start/end token ids ---
+    # Preferred: stored on the model (you can set these after loading vocab)
+    start_idx = getattr(self, "start_idx", None)
+    end_idx = getattr(self, "end_idx", None)
+
+    # Next best: if vocab is attached to decoder (optional)
+    if (start_idx is None or end_idx is None) and hasattr(self, "vocab"):
+        if start_idx is None:
+            start_idx = self.vocab.word2idx.get("<start>", None)
+        if end_idx is None:
+            end_idx = self.vocab.word2idx.get("<end>", None)
+
+    # Fallback: common Udacity convention (<pad>=0, <start>=1, <end>=2, <unk>=3)
+    # If your vocab differs and you don't set start_idx/end_idx, output may be wrong.
+    if start_idx is None:
+        start_idx = 1
+    if end_idx is None:
+        end_idx = 2
+
+    # --- Use existing beam_search with beam_size=1 (greedy) to satisfy Udacity sampler contract ---
+    output = self.beam_search(
+        encoder_out=encoder_out,
+        start_idx=start_idx,
+        end_idx=end_idx,
+        beam_size=1,
+        max_len=max_len,
+        length_norm_alpha=0.0
+    )
+
+    # Ensure Python list[int]
+    if torch.is_tensor(output):
+        output = output.detach().cpu().tolist()
+
+    # Some implementations return nested lists for beam outputs; flatten if needed
+    if isinstance(output, list) and len(output) == 1 and isinstance(output[0], list):
+        output = output[0]
+
+    # Ensure all ints
+    output = [int(x) for x in output]
+
+    return output
