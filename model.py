@@ -10,6 +10,7 @@ class EncoderCNN(nn.Module):
       output shape: (B, num_pixels, encoder_dim)
       where num_pixels = encoded_image_size * encoded_image_size
     """
+
     def __init__(self, encoded_image_size=14, fine_tune=False):
         super().__init__()
         self.enc_image_size = encoded_image_size
@@ -35,9 +36,7 @@ class EncoderCNN(nn.Module):
         return features
 
     def fine_tune(self, fine_tune=False):
-        """
-        If fine_tune=True, unfreeze last conv blocks to fine-tune.
-        """
+        """If fine_tune=True, unfreeze last conv blocks to fine-tune."""
         for p in self.resnet.parameters():
             p.requires_grad = False
 
@@ -49,9 +48,8 @@ class EncoderCNN(nn.Module):
 
 
 class Attention(nn.Module):
-    """
-    Additive (Bahdanau) attention over spatial encoder features.
-    """
+    """Additive (Bahdanau) attention over spatial encoder features."""
+
     def __init__(self, encoder_dim, decoder_dim, attention_dim):
         super().__init__()
         self.encoder_att = nn.Linear(encoder_dim, attention_dim)
@@ -75,9 +73,8 @@ class Attention(nn.Module):
 
 
 class DecoderRNN(nn.Module):
-    """
-    Attention-based LSTM decoder.
-    """
+    """Attention-based LSTM decoder."""
+
     def __init__(self, embed_size, hidden_size, vocab_size,
                  encoder_dim=2048, attention_dim=512, dropout=0.5):
         super().__init__()
@@ -109,7 +106,8 @@ class DecoderRNN(nn.Module):
         self.fc.weight.data.uniform_(-0.1, 0.1)
 
     def init_hidden_state(self, encoder_out):
-        """
+        """Initialize LSTM hidden state from mean encoder features.
+
         encoder_out: (B, num_pixels, encoder_dim)
         """
         mean_enc = encoder_out.mean(dim=1)    # (B, encoder_dim)
@@ -118,8 +116,8 @@ class DecoderRNN(nn.Module):
         return h, c
 
     def forward(self, encoder_out, captions, lengths):
-        """
-        Training forward.
+        """Training forward.
+
         encoder_out: (B, num_pixels, encoder_dim)
         captions: (B, max_len) with <start> at pos 0
         lengths: list[int] lengths including <start>/<end>
@@ -157,8 +155,8 @@ class DecoderRNN(nn.Module):
     @torch.no_grad()
     def beam_search(self, encoder_out, start_idx, end_idx, beam_size=5,
                     max_len=25, length_norm_alpha=0.7):
-        """
-        Beam search decoding for a single image.
+        """Beam search decoding for a single image.
+
         encoder_out: (1, num_pixels, encoder_dim)
         returns: list[int] token ids
         """
@@ -180,11 +178,11 @@ class DecoderRNN(nn.Module):
 
         cur_beam = beam_size
 
-        for t in range(max_len):
+        for _t in range(max_len):
             prev_words = seqs[:, -1]                 # (beam,)
             embeddings = self.embedding(prev_words)  # (beam, embed)
 
-            context, alpha = self.attention(encoder_out, h)
+            context, _alpha = self.attention(encoder_out, h)
             gate = self.sigmoid(self.f_beta(h))
             context = gate * context
 
@@ -238,72 +236,71 @@ class DecoderRNN(nn.Module):
             best_seq = seqs[scores.argmax().item()]
 
         return best_seq.tolist()
+
     def sample(self, features, max_len=25):
-    """
-    Udacity-required sampler.
-    Args:
-        features: embedded image features for a single image.
-                  Common shapes:
-                    - (1, num_pixels, encoder_dim)  e.g., (1, 65536, 2048)
-                    - (1, 1, num_pixels, encoder_dim) if notebook did unsqueeze(1)
-                    - (1, 1, embed_dim) in non-attention baselines
-        max_len: maximum caption length to generate
+        """
+        Udacity-required sampler.
+        Args:
+            features: embedded image features for a single image.
+                      Common shapes:
+                        - (1, num_pixels, encoder_dim)  e.g., (1, 65536, 2048)
+                        - (1, 1, num_pixels, encoder_dim) if notebook did unsqueeze(1)
+                        - (1, 1, embed_dim) in non-attention baselines
+            max_len: maximum caption length to generate
 
-    Returns:
-        output: Python list of ints (token ids)
-    """
+        Returns:
+            output: Python list of ints (token ids)
+        """
 
-    # --- Normalize feature shape to what beam_search expects: (B, num_pixels, encoder_dim) ---
-    encoder_out = features
+        # --- Normalize feature shape to what beam_search expects: (B, num_pixels, encoder_dim) ---
+        encoder_out = features
 
-    # If notebook passed (1, 1, num_pixels, encoder_dim), squeeze the extra dim
-    if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
-        encoder_out = encoder_out.squeeze(1)  # -> (1, num_pixels, encoder_dim)
+        # If notebook passed (1, 1, num_pixels, encoder_dim), squeeze the extra dim
+        if encoder_out.dim() == 4 and encoder_out.size(1) == 1:
+            encoder_out = encoder_out.squeeze(1)  # -> (1, num_pixels, encoder_dim)
 
-    # If baseline passed (1, embed_dim), convert to (1, 1, embed_dim)
-    if encoder_out.dim() == 2:
-        encoder_out = encoder_out.unsqueeze(1)
+        # If baseline passed (1, embed_dim), convert to (1, 1, embed_dim)
+        if encoder_out.dim() == 2:
+            encoder_out = encoder_out.unsqueeze(1)
 
-    # If baseline passed (1, 1, embed_dim) keep as-is; beam_search should handle num_pixels=1
+        # --- Determine start/end token ids ---
+        # Preferred: stored on the model (you can set these after loading vocab)
+        start_idx = getattr(self, "start_idx", None)
+        end_idx = getattr(self, "end_idx", None)
 
-    # --- Determine start/end token ids ---
-    # Preferred: stored on the model (you can set these after loading vocab)
-    start_idx = getattr(self, "start_idx", None)
-    end_idx = getattr(self, "end_idx", None)
+        # Next best: if vocab is attached to decoder (optional)
+        if (start_idx is None or end_idx is None) and hasattr(self, "vocab"):
+            if start_idx is None:
+                start_idx = self.vocab.word2idx.get("<start>", None)
+            if end_idx is None:
+                end_idx = self.vocab.word2idx.get("<end>", None)
 
-    # Next best: if vocab is attached to decoder (optional)
-    if (start_idx is None or end_idx is None) and hasattr(self, "vocab"):
+        # Fallback: common Udacity convention (<pad>=0, <start>=1, <end>=2, <unk>=3)
+        # If your vocab differs and you don't set start_idx/end_idx, output may be wrong.
         if start_idx is None:
-            start_idx = self.vocab.word2idx.get("<start>", None)
+            start_idx = 1
         if end_idx is None:
-            end_idx = self.vocab.word2idx.get("<end>", None)
+            end_idx = 2
 
-    # Fallback: common Udacity convention (<pad>=0, <start>=1, <end>=2, <unk>=3)
-    # If your vocab differs and you don't set start_idx/end_idx, output may be wrong.
-    if start_idx is None:
-        start_idx = 1
-    if end_idx is None:
-        end_idx = 2
+        # --- Use existing beam_search with beam_size=1 (greedy) to satisfy Udacity sampler contract ---
+        output = self.beam_search(
+            encoder_out=encoder_out,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            beam_size=1,
+            max_len=max_len,
+            length_norm_alpha=0.0,
+        )
 
-    # --- Use existing beam_search with beam_size=1 (greedy) to satisfy Udacity sampler contract ---
-    output = self.beam_search(
-        encoder_out=encoder_out,
-        start_idx=start_idx,
-        end_idx=end_idx,
-        beam_size=1,
-        max_len=max_len,
-        length_norm_alpha=0.0
-    )
+        # Ensure Python list[int]
+        if torch.is_tensor(output):
+            output = output.detach().cpu().tolist()
 
-    # Ensure Python list[int]
-    if torch.is_tensor(output):
-        output = output.detach().cpu().tolist()
+        # Some implementations return nested lists for beam outputs; flatten if needed
+        if isinstance(output, list) and len(output) == 1 and isinstance(output[0], list):
+            output = output[0]
 
-    # Some implementations return nested lists for beam outputs; flatten if needed
-    if isinstance(output, list) and len(output) == 1 and isinstance(output[0], list):
-        output = output[0]
+        # Ensure all ints
+        output = [int(x) for x in output]
 
-    # Ensure all ints
-    output = [int(x) for x in output]
-
-    return output
+        return output
