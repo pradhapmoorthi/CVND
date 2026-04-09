@@ -113,28 +113,49 @@ class DecoderRNN(nn.Module):
     # Training (teacher forcing)
     # -----------------------------
     def forward(self, encoder_out, captions):
-        batch_size = encoder_out.size(0)
-        embeddings = self.embedding(captions[:, :-1])
+    """
+    Training forward pass (teacher forcing).
 
-        h, c = self.init_hidden_state(encoder_out)
+    encoder_out: (B, 49, 2048)
+    captions:    (B, seq_len)
 
-        outputs = torch.zeros(
-            batch_size,
-            embeddings.size(1),
-            self.vocab_size,
-            device=encoder_out.device,
+    returns:
+        outputs: (B, seq_len-1, vocab_size)
+        alphas:  (B, seq_len-1, num_pixels)
+    """
+    batch_size = encoder_out.size(0)
+    num_pixels = encoder_out.size(1)
+
+    embeddings = self.embedding(captions[:, :-1])
+
+    h, c = self.init_hidden_state(encoder_out)
+
+    outputs = torch.zeros(
+        batch_size,
+        embeddings.size(1),
+        self.vocab_size,
+        device=encoder_out.device,
+    )
+
+    alphas = torch.zeros(
+        batch_size,
+        embeddings.size(1),
+        num_pixels,
+        device=encoder_out.device,
+    )
+
+    for t in range(embeddings.size(1)):
+        context, alpha = self.attention(encoder_out, h)
+
+        lstm_input = torch.cat(
+            [embeddings[:, t, :], context], dim=1
         )
+        h, c = self.lstm(lstm_input, (h, c))
 
-        for t in range(embeddings.size(1)):
-            context, _ = self.attention(encoder_out, h)
-            lstm_input = torch.cat(
-                [embeddings[:, t, :], context], dim=1
-            )
-            h, c = self.lstm(lstm_input, (h, c))
-            outputs[:, t, :] = self.fc(self.dropout(h))
+        outputs[:, t, :] = self.fc(self.dropout(h))
+        alphas[:, t, :] = alpha
 
-        return outputs
-
+    return outputs, alphas
     # -----------------------------
     # Greedy decoding
     # -----------------------------
