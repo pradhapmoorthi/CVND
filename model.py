@@ -1,3 +1,5 @@
+# model.py
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -8,35 +10,66 @@ import torchvision.models as models
 # ============================================================
 
 class EncoderCNN(nn.Module):
-    def __init__(self, encoded_image_size=7):
-        super(EncoderCNN, self).__init__()
+    """
+    Encodes an input image into a spatial feature map suitable for attention.
+
+    Output shape:
+        (B, num_pixels, encoder_dim)
+        where num_pixels = encoded_image_size * encoded_image_size
+              encoder_dim = 2048 for ResNet-50
+    """
+
+    def __init__(self, encoded_image_size: int = 7):
+        super().__init__()
 
         self.enc_image_size = encoded_image_size
 
+        # NOTE: torchvision API has evolved; pretrained=True still works in many setups,
+        # but newer versions prefer weights=...
         resnet = models.resnet50(pretrained=True)
+
+        # Freeze all ResNet params by default
         for param in resnet.parameters():
             param.requires_grad = False
 
-        # Keep spatial feature map
+        # Remove avgpool + fc to keep spatial feature map
         modules = list(resnet.children())[:-2]
         self.resnet = nn.Sequential(*modules)
 
+        # Adaptive pooling to fixed spatial size (encoded_image_size x encoded_image_size)
         self.adaptive_pool = nn.AdaptiveAvgPool2d(
             (encoded_image_size, encoded_image_size)
         )
 
-    def forward(self, images):
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
-        images: (B, 3, 224, 224)
-        returns: (B, 49, 2048)
+        images:  (B, 3, 224, 224)
+        returns: (B, encoded_image_size*encoded_image_size, 2048)
+                 e.g. (B, 49, 2048) when encoded_image_size=7
         """
-        features = self.resnet(images)
-        features = self.adaptive_pool(features)
-        features = features.permute(0, 2, 3, 1)
-        features = features.view(
-            features.size(0), -1, features.size(-1)
-        )
+        features = self.resnet(images)                    # (B, 2048, H/32, W/32)
+        features = self.adaptive_pool(features)           # (B, 2048, S, S)
+        features = features.permute(0, 2, 3, 1)           # (B, S, S, 2048)
+        features = features.view(features.size(0), -1, features.size(-1))  # (B, S*S, 2048)
         return features
+
+    def fine_tune(self, enable: bool = True):
+        """
+        Optionally unfreeze some layers for fine-tuning.
+        By default, encoder is frozen.
+        """
+        # If enabling fine-tune, unfreeze later layers (common choice: layer2+)
+        for p in self.resnet.parameters():
+            p.requires_grad = False
+
+        if enable:
+            # Unfreeze layer2, layer3, layer4
+            for child_name, child in self.resnet.named_children():
+                # In ResNet sequential children indices: 0 conv1, 1 bn1, 2 relu, 3 maxpool,
+                # 4 layer1, 5 layer2, 6 layer3, 7 layer4
+                if child_name in ["5", "6", "7"]:
+                    for p in child.parameters():
+                        p.requires_grad = True
 
 
 # ============================================================
@@ -44,8 +77,14 @@ class EncoderCNN(nn.Module):
 # ============================================================
 
 class Attention(nn.Module):
-    def __init__(self, encoder_dim, decoder_dim, attention_dim):
-        super(Attention, self).__init__()
+    """
+    Additive (Bahdanau) attention:
+        Given encoder_out (B, num_pixels, encoder_dim) and decoder_hidden (B, decoder_dim),
+        returns context (B, encoder_dim) and alpha (B, num_pixels)
+    """
+
+    def __init__(self, encoder_dim: int, decoder_dim: int, attention_dim: int):
+        super().__init__()
 
         self.encoder_att = nn.Linear(encoder_dim, attention_dim)
         self.decoder_att = nn.Linear(decoder_dim, attention_dim)
@@ -54,126 +93,146 @@ class Attention(nn.Module):
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, encoder_out, decoder_hidden):
-        att1 = self.encoder_att(encoder_out)
-        att2 = self.decoder_att(decoder_hidden).unsqueeze(1)
-        energy = self.full_att(
-            self.relu(att1 + att2)
-        ).squeeze(2)
+    def forward(self, encoder_out: torch.Tensor, decoder_hidden: torch.Tensor):
+        """
+        encoder_out:    (B, num_pixels, encoder_dim)
+        decoder_hidden: (B, decoder_dim)
+        """
+        att1 = self.encoder_att(encoder_out)                       # (B, num_pixels, att_dim)
+        att2 = self.decoder_att(decoder_hidden).unsqueeze(1)       # (B, 1, att_dim)
+        energy = self.full_att(self.relu(att1 + att2)).squeeze(2)  # (B, num_pixels)
 
-        alpha = self.softmax(energy)
-        context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)
+        alpha = self.softmax(energy)                               # (B, num_pixels)
+        context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)    # (B, encoder_dim)
 
         return context, alpha
 
 
 # ============================================================
-# Decoder RNN with Attention + Beam Search
+# Decoder RNN with Attention + Greedy/Beam Search
 # ============================================================
 
 class DecoderRNN(nn.Module):
+    """
+    Attention-based decoder using LSTMCell.
+
+    Training forward (teacher forcing):
+        inputs: encoder_out (B, num_pixels, encoder_dim), captions (B, seq_len)
+        returns: outputs (B, seq_len-1, vocab_size), alphas (B, seq_len-1, num_pixels)
+
+    Inference:
+        sample() -> greedy decoding
+        beam_search() -> beam decoding (assumes batch=1 encoder_out)
+    """
+
     def __init__(
         self,
-        attention_dim,
-        embed_size,
-        hidden_size,
-        vocab_size,
-        encoder_dim=2048,
-        dropout=0.5,
+        attention_dim: int,
+        embed_size: int,
+        hidden_size: int,
+        vocab_size: int,
+        encoder_dim: int = 2048,
+        dropout: float = 0.5,
     ):
-        super(DecoderRNN, self).__init__()
+        super().__init__()
 
         self.encoder_dim = encoder_dim
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
 
-        self.attention = Attention(
-            encoder_dim, hidden_size, attention_dim
-        )
+        self.attention = Attention(encoder_dim, hidden_size, attention_dim)
 
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.dropout = nn.Dropout(dropout)
 
-        self.lstm = nn.LSTMCell(
-            embed_size + encoder_dim, hidden_size
-        )
+        self.lstm = nn.LSTMCell(embed_size + encoder_dim, hidden_size)
 
         self.init_h = nn.Linear(encoder_dim, hidden_size)
         self.init_c = nn.Linear(encoder_dim, hidden_size)
 
         self.fc = nn.Linear(hidden_size, vocab_size)
 
-    def init_hidden_state(self, encoder_out):
-        mean_encoder_out = encoder_out.mean(dim=1)
-        h = self.init_h(mean_encoder_out)
-        c = self.init_c(mean_encoder_out)
+    def init_hidden_state(self, encoder_out: torch.Tensor):
+        """
+        Initialize LSTM hidden and cell from mean-pooled encoder features.
+        encoder_out: (B, num_pixels, encoder_dim)
+        """
+        mean_encoder_out = encoder_out.mean(dim=1)  # (B, encoder_dim)
+        h = self.init_h(mean_encoder_out)           # (B, hidden)
+        c = self.init_c(mean_encoder_out)           # (B, hidden)
         return h, c
 
     # -----------------------------
     # Training (teacher forcing)
     # -----------------------------
-    def forward(self, encoder_out, captions):
-    """
-    Training forward pass (teacher forcing).
+    def forward(self, encoder_out: torch.Tensor, captions: torch.Tensor):
+        """
+        Training forward pass (teacher forcing).
 
-    encoder_out: (B, 49, 2048)
-    captions:    (B, seq_len)
+        encoder_out: (B, num_pixels, encoder_dim) e.g. (B, 49, 2048)
+        captions:    (B, seq_len)  (tokenized, includes <start> ... <end> typically)
 
-    returns:
-        outputs: (B, seq_len-1, vocab_size)
-        alphas:  (B, seq_len-1, num_pixels)
-    """
-    batch_size = encoder_out.size(0)
-    num_pixels = encoder_out.size(1)
+        returns:
+            outputs: (B, seq_len-1, vocab_size)
+            alphas:  (B, seq_len-1, num_pixels)
+        """
+        batch_size = encoder_out.size(0)
+        num_pixels = encoder_out.size(1)
 
-    embeddings = self.embedding(captions[:, :-1])
+        # We don't input the last token to the decoder during teacher forcing
+        embeddings = self.embedding(captions[:, :-1])  # (B, seq_len-1, embed_size)
 
-    h, c = self.init_hidden_state(encoder_out)
+        h, c = self.init_hidden_state(encoder_out)
 
-    outputs = torch.zeros(
-        batch_size,
-        embeddings.size(1),
-        self.vocab_size,
-        device=encoder_out.device,
-    )
-
-    alphas = torch.zeros(
-        batch_size,
-        embeddings.size(1),
-        num_pixels,
-        device=encoder_out.device,
-    )
-
-    for t in range(embeddings.size(1)):
-        context, alpha = self.attention(encoder_out, h)
-
-        lstm_input = torch.cat(
-            [embeddings[:, t, :], context], dim=1
+        outputs = torch.zeros(
+            batch_size,
+            embeddings.size(1),
+            self.vocab_size,
+            device=encoder_out.device,
         )
-        h, c = self.lstm(lstm_input, (h, c))
 
-        outputs[:, t, :] = self.fc(self.dropout(h))
-        alphas[:, t, :] = alpha
+        alphas = torch.zeros(
+            batch_size,
+            embeddings.size(1),
+            num_pixels,
+            device=encoder_out.device,
+        )
 
-    return outputs, alphas
+        for t in range(embeddings.size(1)):
+            context, alpha = self.attention(encoder_out, h)
+
+            lstm_input = torch.cat([embeddings[:, t, :], context], dim=1)
+            h, c = self.lstm(lstm_input, (h, c))
+
+            outputs[:, t, :] = self.fc(self.dropout(h))
+            alphas[:, t, :] = alpha
+
+        return outputs, alphas
+
     # -----------------------------
     # Greedy decoding
     # -----------------------------
-    def sample(self, encoder_out, start_idx, end_idx, max_len=20):
+    @torch.no_grad()
+    def sample(self, encoder_out: torch.Tensor, start_idx: int, end_idx: int, max_len: int = 20):
+        """
+        Greedy caption generation.
+        encoder_out can be (1, num_pixels, encoder_dim) or (B, num_pixels, encoder_dim),
+        but this implementation uses a single running token per batch element only if B=1 ideally.
+        """
         device = encoder_out.device
         h, c = self.init_hidden_state(encoder_out)
 
-        word = torch.tensor([start_idx]).to(device)
+        # Start token
+        word = torch.tensor([start_idx], device=device)
         output_ids = []
 
         for _ in range(max_len):
-            embed = self.embedding(word)
+            embed = self.embedding(word)          # (1, embed_size)
             context, _ = self.attention(encoder_out, h)
-            h, c = self.lstm(
-                torch.cat([embed, context], dim=1), (h, c)
-            )
-            scores = self.fc(h)
-            word = scores.argmax(dim=1)
+
+            h, c = self.lstm(torch.cat([embed, context], dim=1), (h, c))
+            scores = self.fc(h)                   # (1, vocab_size)
+            word = scores.argmax(dim=1)           # (1,)
 
             if word.item() == end_idx:
                 break
@@ -185,18 +244,23 @@ class DecoderRNN(nn.Module):
     # -----------------------------
     # Beam search decoding
     # -----------------------------
+    @torch.no_grad()
     def beam_search(
         self,
-        encoder_out,
-        start_idx,
-        end_idx,
-        beam_size=3,
-        max_len=20,
-        alpha=0.7,
+        encoder_out: torch.Tensor,
+        start_idx: int,
+        end_idx: int,
+        beam_size: int = 3,
+        max_len: int = 20,
+        alpha: float = 0.7,
     ):
         """
         Beam search caption generation.
-        encoder_out: (1, 49, 2048)
+
+        Assumes:
+            encoder_out: (1, num_pixels, encoder_dim)
+        Returns:
+            best_seq: list of token ids (without <start>/<end>)
         """
         device = encoder_out.device
 
@@ -209,31 +273,36 @@ class DecoderRNN(nn.Module):
         for _ in range(max_len):
             new_beams = []
 
-            for log_prob, seq, h, c in beams:
+            for log_prob, seq, h_b, c_b in beams:
                 if seq[-1] == end_idx:
                     completed.append((log_prob, seq))
                     continue
 
-                word = torch.tensor([seq[-1]]).to(device)
-                embed = self.embedding(word)
-                context, _ = self.attention(encoder_out, h)
+                word = torch.tensor([seq[-1]], device=device)
+                embed = self.embedding(word)      # (1, embed_size)
+                context, _ = self.attention(encoder_out, h_b)
 
-                h_new, c_new = self.lstm(
-                    torch.cat([embed, context], dim=1), (h, c)
-                )
+                h_new, c_new = self.lstm(torch.cat([embed, context], dim=1), (h_b, c_b))
 
-                scores = self.fc(h_new)
+                scores = self.fc(h_new)           # (1, vocab_size)
                 log_probs = torch.log_softmax(scores, dim=1)
+
                 top_log_probs, top_words = log_probs.topk(beam_size, dim=1)
 
                 for i in range(beam_size):
-                    new_seq = seq + [top_words[0, i].item()]
-                    new_log_prob = log_prob + top_log_probs[0, i].item()
+                    next_word = top_words[0, i].item()
+                    next_log_prob = top_log_probs[0, i].item()
 
-                    new_beams.append(
-                        (new_log_prob, new_seq, h_new, c_new)
-                    )
+                    new_seq = seq + [next_word]
+                    new_log_prob = log_prob + next_log_prob
 
+                    new_beams.append((new_log_prob, new_seq, h_new, c_new))
+
+            # If no candidates (can happen if all beams completed)
+            if not new_beams:
+                break
+
+            # Length-normalized sorting
             beams = sorted(
                 new_beams,
                 key=lambda x: x[0] / (len(x[1]) ** alpha),
@@ -243,7 +312,9 @@ class DecoderRNN(nn.Module):
             if all(seq[-1] == end_idx for _, seq, _, _ in beams):
                 break
 
-        completed.extend((log_prob, seq) for log_prob, seq, _, _ in beams)
+        # Add remaining beams to completed
+        for log_prob, seq, _, _ in beams:
+            completed.append((log_prob, seq))
 
         completed.sort(
             key=lambda x: x[0] / (len(x[1]) ** alpha),
@@ -253,7 +324,7 @@ class DecoderRNN(nn.Module):
         best_seq = completed[0][1]
 
         # Remove <start> and <end>
-        if best_seq[0] == start_idx:
+        if best_seq and best_seq[0] == start_idx:
             best_seq = best_seq[1:]
         if best_seq and best_seq[-1] == end_idx:
             best_seq = best_seq[:-1]
