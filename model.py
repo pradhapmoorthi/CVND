@@ -22,24 +22,51 @@ class EncoderCNN(nn.Module):
     def __init__(self, encoded_image_size: int = 7):
         super().__init__()
 
+        # -----------------------------
+        # Safety guard (prevents OOM)
+        # -----------------------------
+        # If someone accidentally passes embed_size (e.g., 2048) here,
+        # AdaptiveAvgPool2d would try to output (2048 x 2048) spatial map -> HUGE memory.
+        if not isinstance(encoded_image_size, int):
+            raise TypeError(f"encoded_image_size must be int, got {type(encoded_image_size)}")
+
+        if encoded_image_size < 1 or encoded_image_size > 32:
+            raise ValueError(
+                f"encoded_image_size={encoded_image_size} is invalid/unsafe. "
+                f"Use a small spatial size like 7, 14, or 8. "
+                f"(Passing values like 2048 will cause CUDA OOM.)"
+            )
+
         self.enc_image_size = encoded_image_size
 
-        # NOTE: torchvision API has evolved; pretrained=True still works in many setups,
-        # but newer versions prefer weights=...
-        resnet = models.resnet50(pretrained=True)
+        # -----------------------------
+        # Load ResNet50 (torchvision API compatible)
+        # -----------------------------
+        try:
+            # Newer torchvision
+            weights = models.ResNet50_Weights.DEFAULT
+            resnet = models.resnet50(weights=weights)
+        except Exception:
+            # Older torchvision fallback
+            resnet = models.resnet50(pretrained=True)
+
+        self._encoder_dim = resnet.fc.in_features  # 2048 for resnet50
 
         # Freeze all ResNet params by default
         for param in resnet.parameters():
             param.requires_grad = False
 
         # Remove avgpool + fc to keep spatial feature map
+        # output: (B, 2048, H/32, W/32)
         modules = list(resnet.children())[:-2]
         self.resnet = nn.Sequential(*modules)
 
-        # Adaptive pooling to fixed spatial size (encoded_image_size x encoded_image_size)
-        self.adaptive_pool = nn.AdaptiveAvgPool2d(
-            (encoded_image_size, encoded_image_size)
-        )
+        # Adaptive pooling to fixed spatial size (S x S)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
+
+    @property
+    def encoder_dim(self) -> int:
+        return self._encoder_dim
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -47,10 +74,17 @@ class EncoderCNN(nn.Module):
         returns: (B, encoded_image_size*encoded_image_size, 2048)
                  e.g. (B, 49, 2048) when encoded_image_size=7
         """
-        features = self.resnet(images)                    # (B, 2048, H/32, W/32)
+        # If resnet is frozen, save memory by not storing intermediate gradients.
+        # (Even if caller forgot torch.no_grad(), this keeps inference safe.)
+        if not any(p.requires_grad for p in self.resnet.parameters()):
+            with torch.no_grad():
+                features = self.resnet(images)
+        else:
+            features = self.resnet(images)
+
         features = self.adaptive_pool(features)           # (B, 2048, S, S)
         features = features.permute(0, 2, 3, 1)           # (B, S, S, 2048)
-        features = features.view(features.size(0), -1, features.size(-1))  # (B, S*S, 2048)
+        features = features.reshape(features.size(0), -1, features.size(-1))  # (B, S*S, 2048)
         return features
 
     def fine_tune(self, enable: bool = True):
@@ -58,15 +92,15 @@ class EncoderCNN(nn.Module):
         Optionally unfreeze some layers for fine-tuning.
         By default, encoder is frozen.
         """
-        # If enabling fine-tune, unfreeze later layers (common choice: layer2+)
+        # Freeze everything first
         for p in self.resnet.parameters():
             p.requires_grad = False
 
         if enable:
             # Unfreeze layer2, layer3, layer4
+            # In ResNet sequential children indices:
+            # 0 conv1, 1 bn1, 2 relu, 3 maxpool, 4 layer1, 5 layer2, 6 layer3, 7 layer4
             for child_name, child in self.resnet.named_children():
-                # In ResNet sequential children indices: 0 conv1, 1 bn1, 2 relu, 3 maxpool,
-                # 4 layer1, 5 layer2, 6 layer3, 7 layer4
                 if child_name in ["5", "6", "7"]:
                     for p in child.parameters():
                         p.requires_grad = True
@@ -179,7 +213,6 @@ class DecoderRNN(nn.Module):
         batch_size = encoder_out.size(0)
         num_pixels = encoder_out.size(1)
 
-        # We don't input the last token to the decoder during teacher forcing
         embeddings = self.embedding(captions[:, :-1])  # (B, seq_len-1, embed_size)
 
         h, c = self.init_hidden_state(encoder_out)
@@ -216,13 +249,18 @@ class DecoderRNN(nn.Module):
     def sample(self, encoder_out: torch.Tensor, start_idx: int, end_idx: int, max_len: int = 20):
         """
         Greedy caption generation.
-        encoder_out can be (1, num_pixels, encoder_dim) or (B, num_pixels, encoder_dim),
-        but this implementation uses a single running token per batch element only if B=1 ideally.
+
+        NOTE:
+            This implementation is intended for batch size 1 in typical CVND inference.
+            If you pass B>1, you should vectorize word selection per batch.
         """
         device = encoder_out.device
+
+        if encoder_out.size(0) != 1:
+            raise ValueError(f"sample() expects batch size 1, got {encoder_out.size(0)}")
+
         h, c = self.init_hidden_state(encoder_out)
 
-        # Start token
         word = torch.tensor([start_idx], device=device)
         output_ids = []
 
@@ -264,9 +302,11 @@ class DecoderRNN(nn.Module):
         """
         device = encoder_out.device
 
+        if encoder_out.size(0) != 1:
+            raise ValueError(f"beam_search() expects batch size 1, got {encoder_out.size(0)}")
+
         h, c = self.init_hidden_state(encoder_out)
 
-        # Each beam: (log_prob, sequence, h, c)
         beams = [(0.0, [start_idx], h, c)]
         completed = []
 
@@ -279,12 +319,11 @@ class DecoderRNN(nn.Module):
                     continue
 
                 word = torch.tensor([seq[-1]], device=device)
-                embed = self.embedding(word)      # (1, embed_size)
+                embed = self.embedding(word)
                 context, _ = self.attention(encoder_out, h_b)
 
                 h_new, c_new = self.lstm(torch.cat([embed, context], dim=1), (h_b, c_b))
-
-                scores = self.fc(h_new)           # (1, vocab_size)
+                scores = self.fc(h_new)
                 log_probs = torch.log_softmax(scores, dim=1)
 
                 top_log_probs, top_words = log_probs.topk(beam_size, dim=1)
@@ -298,11 +337,9 @@ class DecoderRNN(nn.Module):
 
                     new_beams.append((new_log_prob, new_seq, h_new, c_new))
 
-            # If no candidates (can happen if all beams completed)
             if not new_beams:
                 break
 
-            # Length-normalized sorting
             beams = sorted(
                 new_beams,
                 key=lambda x: x[0] / (len(x[1]) ** alpha),
@@ -312,7 +349,6 @@ class DecoderRNN(nn.Module):
             if all(seq[-1] == end_idx for _, seq, _, _ in beams):
                 break
 
-        # Add remaining beams to completed
         for log_prob, seq, _, _ in beams:
             completed.append((log_prob, seq))
 
@@ -323,7 +359,6 @@ class DecoderRNN(nn.Module):
 
         best_seq = completed[0][1]
 
-        # Remove <start> and <end>
         if best_seq and best_seq[0] == start_idx:
             best_seq = best_seq[1:]
         if best_seq and best_seq[-1] == end_idx:
