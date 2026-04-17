@@ -1,5 +1,7 @@
 # model.py
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -26,14 +28,14 @@ class EncoderCNN(nn.Module):
         # Safety guard (prevents OOM)
         # -----------------------------
         # If someone accidentally passes embed_size (e.g., 2048) here,
-        # AdaptiveAvgPool2d would try to output (2048 x 2048) spatial map -> HUGE memory.
+        # AdaptiveAvgPool2d would try to output (2048 x 2048) -> HUGE memory.
         if not isinstance(encoded_image_size, int):
             raise TypeError(f"encoded_image_size must be int, got {type(encoded_image_size)}")
 
         if encoded_image_size < 1 or encoded_image_size > 32:
             raise ValueError(
                 f"encoded_image_size={encoded_image_size} is invalid/unsafe. "
-                f"Use a small spatial size like 7, 14, or 8. "
+                f"Use a small spatial size like 7, 8, 14. "
                 f"(Passing values like 2048 will cause CUDA OOM.)"
             )
 
@@ -74,8 +76,7 @@ class EncoderCNN(nn.Module):
         returns: (B, encoded_image_size*encoded_image_size, 2048)
                  e.g. (B, 49, 2048) when encoded_image_size=7
         """
-        # If resnet is frozen, save memory by not storing intermediate gradients.
-        # (Even if caller forgot torch.no_grad(), this keeps inference safe.)
+        # Save memory if encoder is frozen
         if not any(p.requires_grad for p in self.resnet.parameters()):
             with torch.no_grad():
                 features = self.resnet(images)
@@ -155,8 +156,8 @@ class DecoderRNN(nn.Module):
         returns: outputs (B, seq_len-1, vocab_size), alphas (B, seq_len-1, num_pixels)
 
     Inference:
-        sample() -> greedy decoding
-        beam_search() -> beam decoding (assumes batch=1 encoder_out)
+        sample() -> greedy decoding (batch=1)
+        beam_search() -> beam decoding (expects batch=1 encoder_out)
     """
 
     def __init__(
@@ -243,16 +244,21 @@ class DecoderRNN(nn.Module):
         return outputs, alphas
 
     # -----------------------------
-    # Greedy decoding
+    # Greedy decoding (batch=1)
     # -----------------------------
     @torch.no_grad()
-    def sample(self, encoder_out: torch.Tensor, start_idx: int, end_idx: int, max_len: int = 20):
+    def sample(
+        self,
+        encoder_out: torch.Tensor,
+        start_idx: int,
+        end_idx: int,
+        max_len: int = 20,
+    ):
         """
         Greedy caption generation.
 
-        NOTE:
-            This implementation is intended for batch size 1 in typical CVND inference.
-            If you pass B>1, you should vectorize word selection per batch.
+        Intended for batch size 1.
+        Returns: list of token ids (without <start>/<end>)
         """
         device = encoder_out.device
 
@@ -265,12 +271,12 @@ class DecoderRNN(nn.Module):
         output_ids = []
 
         for _ in range(max_len):
-            embed = self.embedding(word)          # (1, embed_size)
+            embed = self.embedding(word)            # (1, embed_size)
             context, _ = self.attention(encoder_out, h)
 
             h, c = self.lstm(torch.cat([embed, context], dim=1), (h, c))
-            scores = self.fc(h)                   # (1, vocab_size)
-            word = scores.argmax(dim=1)           # (1,)
+            logits = self.fc(h)                     # (1, vocab_size)
+            word = logits.argmax(dim=1)             # (1,)
 
             if word.item() == end_idx:
                 break
@@ -280,7 +286,7 @@ class DecoderRNN(nn.Module):
         return output_ids
 
     # -----------------------------
-    # Beam search decoding
+    # Beam search decoding (FIXED)
     # -----------------------------
     @torch.no_grad()
     def beam_search(
@@ -288,15 +294,16 @@ class DecoderRNN(nn.Module):
         encoder_out: torch.Tensor,
         start_idx: int,
         end_idx: int,
-        beam_size: int = 3,
+        beam_size: int = 5,
         max_len: int = 20,
-        alpha: float = 0.7,
+        length_norm_alpha: float = 0.7,
     ):
         """
-        Beam search caption generation.
+        Correct beam search caption generation.
 
         Assumes:
             encoder_out: (1, num_pixels, encoder_dim)
+
         Returns:
             best_seq: list of token ids (without <start>/<end>)
         """
@@ -305,63 +312,86 @@ class DecoderRNN(nn.Module):
         if encoder_out.size(0) != 1:
             raise ValueError(f"beam_search() expects batch size 1, got {encoder_out.size(0)}")
 
-        h, c = self.init_hidden_state(encoder_out)
+        # Expand encoder output to beam size
+        encoder_out = encoder_out.expand(beam_size, encoder_out.size(1), encoder_out.size(2))  # (k, num_pixels, enc_dim)
 
-        beams = [(0.0, [start_idx], h, c)]
-        completed = []
+        # Initialize hidden state per beam
+        h, c = self.init_hidden_state(encoder_out)  # (k, hidden)
+
+        # Beam sequences start with <start>
+        seqs = torch.full((beam_size, 1), start_idx, dtype=torch.long, device=device)  # (k, 1)
+        seq_scores = torch.zeros(beam_size, device=device)  # cumulative log probs
+
+        completed_seqs = []
+        completed_scores = []
+
+        k = beam_size  # current beam size
 
         for _ in range(max_len):
-            new_beams = []
+            last_words = seqs[:, -1]                         # (k,)
+            embeddings = self.embedding(last_words)          # (k, embed)
 
-            for log_prob, seq, h_b, c_b in beams:
-                if seq[-1] == end_idx:
-                    completed.append((log_prob, seq))
-                    continue
+            context, _ = self.attention(encoder_out, h)      # (k, enc_dim)
 
-                word = torch.tensor([seq[-1]], device=device)
-                embed = self.embedding(word)
-                context, _ = self.attention(encoder_out, h_b)
+            h, c = self.lstm(torch.cat([embeddings, context], dim=1), (h, c))  # (k, hidden)
 
-                h_new, c_new = self.lstm(torch.cat([embed, context], dim=1), (h_b, c_b))
-                scores = self.fc(h_new)
-                log_probs = torch.log_softmax(scores, dim=1)
+            logits = self.fc(h)                              # (k, vocab)
+            log_probs = torch.log_softmax(logits, dim=1)     # (k, vocab)
 
-                top_log_probs, top_words = log_probs.topk(beam_size, dim=1)
+            # Accumulate sequence log-probabilities
+            total_scores = seq_scores.unsqueeze(1) + log_probs  # (k, vocab)
 
-                for i in range(beam_size):
-                    next_word = top_words[0, i].item()
-                    next_log_prob = top_log_probs[0, i].item()
+            # Select top-k over all (beam, vocab) candidates
+            top_scores, top_pos = total_scores.view(-1).topk(k, dim=0)  # (k,)
 
-                    new_seq = seq + [next_word]
-                    new_log_prob = log_prob + next_log_prob
+            beam_indices = top_pos // self.vocab_size  # (k,)
+            token_indices = top_pos % self.vocab_size  # (k,)
 
-                    new_beams.append((new_log_prob, new_seq, h_new, c_new))
+            # Build new sequences
+            seqs = torch.cat([seqs[beam_indices], token_indices.unsqueeze(1)], dim=1)  # (k, step+2)
 
-            if not new_beams:
+            # Determine which sequences have completed
+            incomplete = []
+            for i in range(seqs.size(0)):
+                if token_indices[i].item() == end_idx:
+                    completed_seqs.append(seqs[i].clone())
+                    completed_scores.append(top_scores[i].item())
+                else:
+                    incomplete.append(i)
+
+            # If all beams completed, stop
+            if len(incomplete) == 0:
                 break
 
-            beams = sorted(
-                new_beams,
-                key=lambda x: x[0] / (len(x[1]) ** alpha),
-                reverse=True,
-            )[:beam_size]
+            # Keep only incomplete beams
+            seqs = seqs[incomplete]
+            seq_scores = top_scores[incomplete]
+            h = h[beam_indices[incomplete]]
+            c = c[beam_indices[incomplete]]
+            encoder_out = encoder_out[beam_indices[incomplete]]
 
-            if all(seq[-1] == end_idx for _, seq, _, _ in beams):
-                break
+            k = seqs.size(0)
 
-        for log_prob, seq, _, _ in beams:
-            completed.append((log_prob, seq))
+        # If none completed, fall back to best incomplete
+        if len(completed_seqs) == 0:
+            best_seq = seqs[0]
+        else:
+            # Length normalization: score / (len(seq) ** alpha)
+            norm_scores = []
+            for s, sc in zip(completed_seqs, completed_scores):
+                # s includes <start> and <end>
+                length = max(1, s.size(0))
+                norm_scores.append(sc / (length ** length_norm_alpha))
 
-        completed.sort(
-            key=lambda x: x[0] / (len(x[1]) ** alpha),
-            reverse=True,
-        )
+            best_idx = int(torch.tensor(norm_scores).argmax().item())
+            best_seq = completed_seqs[best_idx]
 
-        best_seq = completed[0][1]
+        # Convert to list and remove <start>/<end>
+        best_seq = best_seq.tolist()
 
-        if best_seq and best_seq[0] == start_idx:
+        if len(best_seq) > 0 and best_seq[0] == start_idx:
             best_seq = best_seq[1:]
-        if best_seq and best_seq[-1] == end_idx:
+        if len(best_seq) > 0 and best_seq[-1] == end_idx:
             best_seq = best_seq[:-1]
 
         return best_seq
